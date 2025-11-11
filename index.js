@@ -1,23 +1,12 @@
 /**
- * index.js - Hugging Face Video Backend
+ * index.js - Hugging Face Video Backend (robust multi-model fallback)
  *
- * Usage:
- * - Set environment variables on Render:
- *     PROVIDER=huggingface
- *     HUGGINGFACE_API_TOKEN=hf_...
- *     PORT (optional)
+ * Set env:
+ * PROVIDER=huggingface
+ * HUGGINGFACE_API_TOKEN=hf_...
+ * PORT=4000
  *
- * - Deploy to Render (no local run required).
- *
- * Endpoint:
- * POST /api/generate
- * Body: { prompt: "text prompt", size: "256x256" }
- * Response: { videos: [ "data:video/mp4;base64,...." ] }
- *
- * NOTE: This uses Hugging Face router endpoint:
- *   https://router.huggingface.co/hf-inference/models/{model}
- *
- * Model used: ali-vilab/text-to-video-ms-1.7b  (short clips ~2-3s)
+ * This file will attempt multiple video models in order until one succeeds.
  */
 
 require('dotenv').config();
@@ -30,165 +19,172 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 app.use(helmet());
 app.use(express.json({ limit: '20mb' }));
+app.use(cors({ origin: process.env.FRONTEND_ORIGIN || '*' }));
 
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
-app.use(cors({ origin: FRONTEND_ORIGIN }));
-
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
+app.use(rateLimit({
+  windowMs: 60 * 1000,
   max: 20,
-  message: { error: 'Too many requests, please slow down.' }
-});
-app.use(limiter);
+  message: { error: 'Too many requests, slow down.' }
+}));
 
 const PORT = process.env.PORT || 4000;
 const PROVIDER = (process.env.PROVIDER || 'huggingface').toLowerCase();
 const HF_TOKEN = process.env.HUGGINGFACE_API_TOKEN;
-
-// Choose video model (text -> short video)
-const HF_MODEL = 'ali-vilab/text-to-video-ms-1.7b';
 const HF_ROUTER_BASE = 'https://router.huggingface.co/hf-inference/models';
 
+// list of candidate video models to try (order matters)
+const CANDIDATE_MODELS = [
+  'ali-vilab/text-to-video-ms-1.7b',
+  'damo-vilab/text-to-video',
+  'stabilityai/stable-video-diffusion-img2vid-xt',
+  'pesser/stable-video-diffusion'
+];
+
 if (PROVIDER !== 'huggingface') {
-  console.warn('Configured provider is not huggingface. Set PROVIDER=huggingface in env.');
+  console.warn('Provider not huggingface. Set PROVIDER=huggingface');
 }
 if (!HF_TOKEN) {
-  console.warn('HUGGINGFACE_API_TOKEN not set in environment.');
+  console.warn('HUGGINGFACE_API_TOKEN missing in env.');
 }
 
-// Helper: call HF router for the model
-async function callHFRouter(model, prompt, options = {}) {
+// call the HF router for a single model; returns { videos } or throws
+async function callModelOnce(model, prompt, options = {}) {
   const url = `${HF_ROUTER_BASE}/${encodeURIComponent(model)}`;
-  // Many video models accept inputs: { inputs: prompt, options: { wait_for_model: true }, parameters: {...} }
   const payload = {
     inputs: prompt,
     options: { wait_for_model: true },
     parameters: {}
   };
-
-  // You can pass additional parameters if model supports (e.g., num_inference_steps, width/height)
   if (options.size) {
-    const [w, h] = String(options.size).split('x').map(x => parseInt(x, 10));
+    const [w,h] = String(options.size).split('x').map(x => parseInt(x,10));
     if (!isNaN(w) && !isNaN(h)) {
-      // Some models accept width/height; include if supported
       payload.parameters.width = w;
       payload.parameters.height = h;
     }
   }
 
-  const resp = await axios.post(url, payload, {
-    headers: {
-      Authorization: `Bearer ${HF_TOKEN}`,
-      Accept: 'application/json'
-    },
-    responseType: 'arraybuffer',
-    timeout: 120000
-  });
+  try {
+    const resp = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        Accept: 'application/json'
+      },
+      responseType: 'arraybuffer',
+      timeout: 120000
+    });
 
-  const contentType = resp.headers['content-type'] || '';
+    const contentType = resp.headers['content-type'] || '';
+    // video bytes
+    if (contentType.startsWith('video/')) {
+      const base64 = Buffer.from(resp.data).toString('base64');
+      return { videos: [`data:${contentType};base64,${base64}`] };
+    }
 
-  // If response is video bytes
-  if (contentType.startsWith('video/')) {
-    const base64 = Buffer.from(resp.data).toString('base64');
-    const dataUrl = `data:${contentType};base64,${base64}`;
-    return { videos: [dataUrl] };
-  }
-
-  // If response is JSON (some models return JSON with keys)
-  if (contentType.includes('application/json') || contentType.includes('text/json')) {
+    // json-like response
     const text = Buffer.from(resp.data).toString('utf8');
-    let parsed = null;
+    let parsed;
     try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
 
-    // Try to extract video bytes or data url inside parsed object
-    // e.g., some HF responses contain base64 strings or urls
+    // extract data:video or mp4 urls
     const videos = [];
     function extract(obj) {
       if (!obj) return;
       if (typeof obj === 'string') {
         if (obj.startsWith('data:video')) videos.push(obj);
-        // if it's a long base64-looking string, assume mp4
-        else if (/^[A-Za-z0-9+/=]{100,}$/.test(obj)) videos.push('data:video/mp4;base64,' + obj);
-      } else if (Array.isArray(obj)) {
-        obj.forEach(extract);
-      } else if (typeof obj === 'object') {
-        Object.values(obj).forEach(extract);
-      }
+        else if (/\.mp4(\?|$)/.test(obj)) videos.push(obj);
+        else if (/^[A-Za-z0-9+/=]{100,}$/.test(obj)) videos.push('data:video/mp4;base64,'+obj);
+      } else if (Array.isArray(obj)) obj.forEach(extract);
+      else if (typeof obj === 'object') Object.values(obj).forEach(extract);
     }
     extract(parsed);
     if (videos.length) return { videos };
-    // maybe model returned a URL to the video
-    if (typeof parsed === 'object') {
-      // try to find strings that look like .mp4 urls
-      const urls = [];
-      function findUrls(o) {
-        if (!o) return;
-        if (typeof o === 'string' && /\.mp4(\?|$)/.test(o)) urls.push(o);
-        else if (Array.isArray(o)) o.forEach(findUrls);
-        else if (typeof o === 'object') Object.values(o).forEach(findUrls);
-      }
-      findUrls(parsed);
-      if (urls.length) return { videos: urls };
-    }
-    // fallback: return raw parsed object for debugging
+
+    // if parsed contains something useful (fallback)
     return { raw: parsed };
+  } catch (err) {
+    // bubble up status and message for caller to interpret
+    if (err.response) {
+      const status = err.response.status;
+      const body = err.response.data ? Buffer.from(err.response.data).toString('utf8') : '';
+      const message = `Model ${model} error: status=${status} body=${body}`;
+      const e = new Error(message);
+      e.status = status;
+      e.body = body;
+      throw e;
+    }
+    throw err;
   }
-
-  throw new Error('Unknown response format from Hugging Face router');
 }
 
-async function generateVideo({ prompt, size = '256x256' }) {
-  if (!HF_TOKEN) throw new Error('HUGGINGFACE_API_TOKEN not configured');
-  // The video models are usually slow; call once per request (n=1)
-  const out = await callHFRouter(HF_MODEL, prompt, { size });
-  // out should contain { videos: [...] } or { raw: ... }
-  if (out.videos && out.videos.length) return out.videos;
-  // If out.raw contains a URL or something, try returning that as single item
-  if (out.raw) {
-    // if parsed raw contains url to video, return that
-    if (typeof out.raw === 'string') return [out.raw];
-    // fallback to returning JSON in data URL so client can show text
-    return ['data:application/json;base64,' + Buffer.from(JSON.stringify(out.raw)).toString('base64')];
+// Try models in order until one succeeds
+async function generateVideoWithFallback(models, prompt, options) {
+  const errors = [];
+  for (const model of models) {
+    console.log(`Trying model: ${model}`);
+    try {
+      const out = await callModelOnce(model, prompt, options);
+      console.log(`Model succeeded: ${model}`);
+      // If out.videos exist return them
+      if (out.videos && out.videos.length) return { model, videos: out.videos };
+      // If raw JSON with mp4 urls, return them
+      if (out.raw) {
+        // try to find mp4 links inside raw
+        const urls = [];
+        (function findUrls(o){
+          if (!o) return;
+          if (typeof o === 'string' && /\.mp4(\?|$)/.test(o)) urls.push(o);
+          else if (Array.isArray(o)) o.forEach(findUrls);
+          else if (typeof o === 'object') Object.values(o).forEach(findUrls);
+        })(out.raw);
+        if (urls.length) return { model, videos: urls };
+        // else return raw as debug
+        return { model, raw: out.raw };
+      }
+      errors.push({ model, note: 'no videos in response' });
+    } catch (err) {
+      // record the error and continue on 404 / 403 etc.
+      console.warn(`Model ${model} failed:`, err.message?.slice?.(0,300) || String(err));
+      errors.push({ model, status: err.status || null, msg: err.message || String(err) });
+      // If non-recoverable (like 401 unauthorized) stop early
+      if (err.status === 401 || err.status === 403) {
+        throw new Error(`Fatal auth error when calling model ${model}: ${err.message}`);
+      }
+      // otherwise continue to next model
+    }
   }
-  throw new Error('No video produced by model');
+  // all failed
+  const e = new Error('All candidate models failed: ' + JSON.stringify(errors));
+  e.details = errors;
+  throw e;
 }
 
-// API endpoint
 app.post('/api/generate', async (req, res) => {
   try {
+    if (PROVIDER !== 'huggingface') return res.status(400).json({ error: 'Unsupported provider' });
+    if (!HF_TOKEN) return res.status(500).json({ error: 'HUGGINGFACE_API_TOKEN not configured' });
+
     const { prompt, size } = req.body || {};
     if (!prompt || !String(prompt).trim()) return res.status(400).json({ error: 'Missing prompt' });
 
-    if (PROVIDER !== 'huggingface') return res.status(400).json({ error: `Unsupported provider: ${PROVIDER}` });
+    const allowed = ['256x256','512x512'];
+    const finalSize = allowed.includes(String(size||'256x256')) ? size : '256x256';
 
-    // safety: ensure small size for free models
-    const allowedSizes = ['256x256', '512x512'];
-    const imgSize = String(size || '256x256');
-    const finalSize = allowedSizes.includes(imgSize) ? imgSize : '256x256';
+    const result = await generateVideoWithFallback(CANDIDATE_MODELS, String(prompt), { size: finalSize });
 
-    const videos = await generateVideo({ prompt: String(prompt), size: finalSize });
-    return res.json({ videos });
-  } catch (err) {
-    let message = 'Generation failed';
-    if (err.response && err.response.data) {
-      try {
-        // try to parse error body
-        const text = Buffer.from(err.response.data).toString('utf8');
-        const parsed = JSON.parse(text);
-        message = parsed.error || JSON.stringify(parsed);
-      } catch (e) {
-        message = String(err.response.data).slice(0, 500);
-      }
-    } else if (err.message) {
-      message = err.message;
+    // success result may contain .videos or .raw
+    if (result.videos && result.videos.length) {
+      return res.json({ model: result.model, videos: result.videos });
+    } else {
+      return res.json({ model: result.model || null, raw: result.raw || null });
     }
-    console.error('Generate error:', message);
-    return res.status(500).json({ error: message });
+  } catch (err) {
+    console.error('Generate error:', err.message?.slice?.(0,1000) || err);
+    // If we have structured details, include them for debugging (safe)
+    const debug = err.details ? err.details : undefined;
+    const msg = err.message || 'Generation failed';
+    return res.status(500).json({ error: msg, debug });
   }
 });
 
-app.get('/', (req, res) => res.send('AI Video Backend (Hugging Face) — running'));
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT} (provider=${PROVIDER})`);
-});
+app.get('/', (req, res) => res.send('AI Video Backend (HF fallback) running'));
+app.listen(PORT, () => console.log(`Server listening on port ${PORT} (provider=${PROVIDER})`));
