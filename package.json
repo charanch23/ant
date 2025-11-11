@@ -1,5 +1,5 @@
 {
-  "name": "ai-video-backend-hf",
+  "name": "ai-video-backend-full",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -12,12 +12,12 @@
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
     "express-rate-limit": "^6.8.0",
-    "helmet": "^7.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^2.0.22"
+    "helmet": "^7.0.0",
+    "gifencoder": "^2.0.1",
+    "jimp": "^0.16.1"
   },
   "engines": {
     "node": "18.x"
   }
 }
+
