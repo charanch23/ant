@@ -1,17 +1,17 @@
 {
-  "name": "ai-video-proxy",
+  "name": "ai-video-backend",
   "version": "1.0.0",
-  "description": "Simple Express proxy to Hugging Face Inference API for text->video",
+  "description": "Express proxy to Hugging Face Inference API for text->video",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "keywords": ["huggingface", "video", "inference", "nodejs"],
-  "author": "",
-  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "axios": "^1.5.0",
+    "axios": "^1.6.2",
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -19,5 +19,6 @@
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
-  }
+  },
+  "license": "MIT"
 }
